@@ -1,3 +1,7 @@
+import hashlib
+import threading
+import time
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -7,6 +11,12 @@ from . import config
 supabase: Client = create_client(config.SUPABASE_URL, config.SUPABASE_KEY)
 bearer_scheme = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Token cache: remembers "this token belongs to this user" for a short time,
+# so we don't ask Supabase over the internet on every single request.
+TOKEN_CACHE_SECONDS = 60
+_token_cache: dict[str, tuple[float, object]] = {}
+_cache_lock = threading.Lock()   # many requests run in parallel threads
 
 
 class Credentials(BaseModel):
@@ -21,12 +31,26 @@ def get_token(credentials: HTTPAuthorizationCredentials | None = Depends(bearer_
 
 
 def get_current_user(token: str = Depends(get_token)):
+    key = hashlib.sha256(token.encode()).hexdigest()   # never keep raw tokens around
+    now = time.monotonic()
+
+    with _cache_lock:
+        cached = _token_cache.get(key)
+    if cached and cached[0] > now:
+        return cached[1]          # cache hit: no network call
+
     try:
         response = supabase.auth.get_user(token)
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     if response is None or response.user is None:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    with _cache_lock:
+        if len(_token_cache) > 10_000:   # stop the cache growing forever
+            for k in [k for k, (exp, _) in _token_cache.items() if exp <= now]:
+                del _token_cache[k]
+        _token_cache[key] = (now + TOKEN_CACHE_SECONDS, response.user)
     return response.user
 
 

@@ -36,6 +36,22 @@ def reserve(user_id: str, amount: Decimal) -> dict | None:
         ).fetchone()
 
 
+def settle(user_id: str, reserved: Decimal, actual: Decimal) -> None:
+    """Swap the reservation for the real cost (refunds the difference).
+
+    On an upstream failure, call with actual=0 to refund everything.
+    """
+    with get_conn() as conn:
+        conn.execute(
+            """
+            UPDATE budgets
+            SET spent_usd = spent_usd - %s + %s, updated_at = now()
+            WHERE user_id = %s
+            """,
+            (reserved, actual, user_id),
+        )
+
+
 def record(user_id: str, model: str, status: str, prompt_tokens: int = 0,
            completion_tokens: int = 0, cost: Decimal = Decimal("0"),
            latency_ms: int | None = None) -> None:

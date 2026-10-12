@@ -1,3 +1,4 @@
+import logging
 import secrets
 import time
 from contextlib import asynccontextmanager
@@ -7,7 +8,7 @@ from fastapi import Depends, FastAPI, HTTPException, Security
 from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
-from . import billing, config
+from . import billing, config, llm
 from .auth import get_current_user, router as auth_router
 from .db import init_db
 
@@ -27,6 +28,7 @@ app = FastAPI(
 app.include_router(auth_router)
 
 admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+logger = logging.getLogger("uvicorn.error")
 
 
 class ChatRequest(BaseModel):
@@ -52,7 +54,7 @@ def require_admin(key: str | None = Security(admin_key_header)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "llm_mode": config.LLM_MODE}
 
 
 @app.get("/v1/me")
@@ -62,29 +64,41 @@ def me(user=Depends(get_current_user)):
 
 @app.post("/v1/chat/completions")
 def chat(body: ChatRequest, user=Depends(get_tenant)):
-    cost = config.MOCK_COST_USD
-    model = "mock"
+    model = llm.model_name()
+    reserved = llm.max_cost(body.prompt)
 
-    # 1. Gate: take the money BEFORE doing the expensive work.
-    if billing.reserve(user.id, cost) is None:
+    # 1. Gate: reserve the WORST-CASE cost before calling the LLM.
+    if billing.reserve(user.id, reserved) is None:
         billing.record(user.id, model, "blocked")
         raise HTTPException(status_code=429, detail="Monthly budget exceeded")
 
-    # 2. Work (mock for now; the real Gemini call replaces this in Stage 4).
+    # 2. Work: call the LLM. If it fails, give the money back.
     start = time.perf_counter()
-    reply = f"[mock] You said: {body.prompt[:80]}"
+    try:
+        result = llm.complete(body.prompt)
+    except llm.LLMError as e:
+        logger.warning("LLM call failed for user %s: %s", user.id, e)
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        billing.settle(user.id, reserved, Decimal("0"))
+        billing.record(user.id, model, "upstream_error", latency_ms=latency_ms)
+        raise HTTPException(status_code=502, detail="LLM provider failed. You were not charged.")
     latency_ms = int((time.perf_counter() - start) * 1000)
-    prompt_tokens = max(1, len(body.prompt) // 4)   # rough: ~4 chars per token
-    completion_tokens = max(1, len(reply) // 4)
 
-    # 3. Ledger: permanent record of what happened.
-    billing.record(user.id, model, "ok", prompt_tokens, completion_tokens, cost, latency_ms)
+    # 3. Settle: swap the reservation for the real cost, then write the ledger.
+    billing.settle(user.id, reserved, result.cost)
+    billing.record(user.id, result.model, "ok", result.prompt_tokens,
+                   result.completion_tokens, result.cost, latency_ms)
 
     return {
-        "model": model,
-        "reply": reply,
-        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens},
-        "cost_usd": cost,
+        "model": result.model,
+        "reply": result.text,
+        "usage": {
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+        },
+        "reserved_usd": reserved,
+        "cost_usd": result.cost,
+        "latency_ms": latency_ms,
     }
 
 
